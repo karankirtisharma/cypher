@@ -14,7 +14,6 @@ const SPLASH_DURATION_MS = 8200;
 const TRANSITION_DURATION_MS = 1400;
 const TRANSITION_MIDPOINT_MS = 700;
 const AUTO_SCROLL_DELAY_MS = 1600;
-const SEQUENCE_TRIGGER_ID = 'cyphernaut-sequence';
 
 export default function SplashPage() {
   const [mounted, setMounted] = useState(false);
@@ -34,18 +33,8 @@ export default function SplashPage() {
   const imagesRef = useRef<HTMLImageElement[]>([]);
   const imagesLoadedRef = useRef(false);
   const lenisRef = useRef<any>(null);
-  const rafIdRef = useRef<number>(0);
   const lastRenderedFrameRef = useRef(-1);
   const dropletsRef = useRef<{ tx: string; ty: string; delay: string }[]>([]);
-
-  // Pre-generate droplets once (avoids hydration mismatch via ref)
-  if (dropletsRef.current.length === 0 && typeof window !== 'undefined') {
-    dropletsRef.current = Array.from({ length: 16 }, () => ({
-      tx: `${(Math.random() - 0.5) * 1200}px`,
-      ty: `${(Math.random() - 0.5) * 1200}px`,
-      delay: `${Math.random() * 0.4}s`,
-    }));
-  }
 
   // ── Canvas Frame Renderer (memoized, no deps on state) ──
   const renderFrame = useCallback((index: number) => {
@@ -128,14 +117,12 @@ export default function SplashPage() {
   useEffect(() => {
     setMounted(true);
 
-    // Generate droplets client-side for hydration safety
-    if (dropletsRef.current.length === 0) {
-      dropletsRef.current = Array.from({ length: 16 }, () => ({
-        tx: `${(Math.random() - 0.5) * 1200}px`,
-        ty: `${(Math.random() - 0.5) * 1200}px`,
-        delay: `${Math.random() * 0.4}s`,
-      }));
-    }
+    // Generate droplets only on client to ensure zero hydration mismatch
+    dropletsRef.current = Array.from({ length: 16 }, () => ({
+      tx: `${(Math.random() - 0.5) * 1200}px`,
+      ty: `${(Math.random() - 0.5) * 1200}px`,
+      delay: `${Math.random() * 0.4}s`,
+    }));
 
     const lenis = new Lenis({
       duration: 1.2,
@@ -143,16 +130,18 @@ export default function SplashPage() {
     });
     lenisRef.current = lenis;
 
-    function raf(time: number) {
-      lenis.raf(time);
-      rafIdRef.current = requestAnimationFrame(raf);
-    }
-    rafIdRef.current = requestAnimationFrame(raf);
+    // Drive Lenis through GSAP ticker — one shared RAF loop, no double-tick
+    const lenisTickerFn = (time: number) => {
+      lenis.raf(time * 1000);
+    };
+    gsap.ticker.add(lenisTickerFn);
+    gsap.ticker.lagSmoothing(0);
 
+    // Keep ScrollTrigger in sync with Lenis
     lenis.on('scroll', ScrollTrigger.update);
 
     return () => {
-      cancelAnimationFrame(rafIdRef.current);
+      gsap.ticker.remove(lenisTickerFn);
       lenis.destroy();
       lenisRef.current = null;
     };
@@ -183,12 +172,13 @@ export default function SplashPage() {
     return () => clearTimeout(timer);
   }, [isEntering, isAppActive, toApp]);
 
-  // ── 3. Canvas Sequence + GSAP ScrollTrigger ──
+  // ── 3. Canvas Sequence — Direct Lenis Scroll Mapping (zero lag) ──
   useEffect(() => {
     if (!isAppActive || !mounted) return;
 
     const canvas = canvasRef.current;
-    if (!canvas) return;
+    const container = containerRef.current;
+    if (!canvas || !container) return;
 
     const context = canvas.getContext('2d', { alpha: false });
     if (!context) return;
@@ -198,7 +188,7 @@ export default function SplashPage() {
     canvas.width = window.innerWidth;
     canvas.height = window.innerHeight;
 
-    // Preload images ONCE (fixes memory leak)
+    // Preload images ONCE
     if (!imagesLoadedRef.current) {
       imagesLoadedRef.current = true;
       imagesRef.current = [];
@@ -207,54 +197,40 @@ export default function SplashPage() {
         const img = new (window as any).Image() as HTMLImageElement;
         img.src = `/sequence/ezgif-frame-${(i + 1).toString().padStart(3, '0')}.webp`;
         imagesRef.current.push(img);
-
-        // Render first frame as soon as it loads
-        if (i === 0) {
-          img.onload = () => renderFrame(0);
-        }
+        if (i === 0) img.onload = () => renderFrame(0);
       }
     } else {
-      // Images already loaded — render current frame
       renderFrame(0);
     }
 
-    // GSAP ScrollTrigger for frame scrubbing
-    const frameObj = { value: 0 };
-    const scrollTl = gsap.to(frameObj, {
-      value: FRAME_COUNT - 1,
-      ease: 'none',
-      scrollTrigger: {
-        trigger: containerRef.current,
-        start: 'top top',
-        end: 'bottom bottom',
-        scrub: 0.15,
-        id: SEQUENCE_TRIGGER_ID,
-        onUpdate: (self) => {
-          const frame = Math.round(self.progress * (FRAME_COUNT - 1));
-          renderFrame(frame);
-        },
-      },
-    });
+    // Direct scroll → frame mapping via Lenis (no GSAP tween lag)
+    const onScroll = ({ scroll }: { scroll: number }) => {
+      const containerHeight = container.scrollHeight - window.innerHeight;
+      if (containerHeight <= 0) return;
+      const progress = Math.min(1, Math.max(0, scroll / containerHeight));
+      const frame = Math.round(progress * (FRAME_COUNT - 1));
+      renderFrame(frame);
+    };
+
+    if (lenisRef.current) {
+      lenisRef.current.on('scroll', onScroll);
+    }
 
     const handleResize = () => {
       if (!canvasRef.current) return;
       canvasRef.current.width = window.innerWidth;
       canvasRef.current.height = window.innerHeight;
-      lastRenderedFrameRef.current = -1; // Force re-draw on resize
-
-      const trigger = ScrollTrigger.getById(SEQUENCE_TRIGGER_ID);
-      const progress = trigger?.progress ?? 0;
-      renderFrame(Math.round(progress * (FRAME_COUNT - 1)));
+      lastRenderedFrameRef.current = -1;
+      onScroll({ scroll: window.scrollY });
     };
 
     window.addEventListener('resize', handleResize);
 
     return () => {
       window.removeEventListener('resize', handleResize);
-      scrollTl.kill();
-      // Kill ONLY our trigger, not others
-      const trigger = ScrollTrigger.getById(SEQUENCE_TRIGGER_ID);
-      if (trigger) trigger.kill();
+      if (lenisRef.current) {
+        lenisRef.current.off('scroll', onScroll);
+      }
     };
   }, [isAppActive, mounted, renderFrame]);
 
@@ -302,7 +278,7 @@ export default function SplashPage() {
   }, []);
 
   // ── SSR Guard ──
-  if (!mounted) return <main className="min-h-screen bg-cypher-dark" />;
+  if (!mounted) return <div className="relative w-full min-h-screen bg-cypher-dark" />;
 
   // ── Render: Main App Content ──
   const MainContent = (
@@ -311,8 +287,8 @@ export default function SplashPage() {
       <div className="fixed inset-0 z-0">
         <canvas
           ref={canvasRef}
-          className="w-full h-full object-cover grayscale-[0.2] brightness-75"
-          style={{ willChange: 'contents' }}
+          className="w-full h-full grayscale-[0.2] brightness-75"
+          style={{ display: 'block', willChange: 'auto' }}
         />
         <div className="absolute inset-0 bg-radial-[at_center_center] from-transparent via-transparent to-black/80 pointer-events-none" />
         <div className="absolute inset-0 bg-grid opacity-20 pointer-events-none" />
